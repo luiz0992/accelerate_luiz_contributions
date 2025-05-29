@@ -16,6 +16,7 @@ import argparse
 import os
 import subprocess
 import sys
+import warnings
 from ast import literal_eval
 from shutil import which
 from typing import Any
@@ -26,6 +27,7 @@ from ..commands.config.config_args import SageMakerConfig
 from ..utils import (
     DynamoBackend,
     PrecisionType,
+    is_ccl_available,
     is_fp8_available,
     is_hpu_available,
     is_ipex_available,
@@ -37,7 +39,7 @@ from ..utils import (
     is_xpu_available,
 )
 from ..utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS
-from ..utils.other import is_port_in_use, merge_dicts
+from ..utils.other import get_free_port, is_port_in_use, merge_dicts
 from ..utils.versions import compare_versions
 from .dataclasses import DistributedType, SageMakerDistributedType
 
@@ -103,12 +105,11 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
     if args.no_python and args.module:
         raise ValueError("--module and --no_python cannot be used together")
 
+    num_processes = getattr(args, "num_processes", None)
+    num_machines = args.num_machines
     if args.mpirun_hostfile is not None:
         mpi_app_name, hostfile_arg, num_proc_arg, proc_per_node_arg, bind_to_arg = _get_mpirun_args()
-        mpirun_ccl = getattr(args, "mpirun_ccl", None)
         bind_to = getattr(args, "bind-to", "socket")
-        num_machines = args.num_machines
-        num_processes = getattr(args, "num_processes", None)
         nproc_per_node = str(num_processes // num_machines) if num_processes and num_machines else "1"
         cmd += [
             mpi_app_name,
@@ -147,15 +148,22 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
             current_env["HABANA_VISIBLE_MODULES"] = args.gpu_ids
         else:
             current_env["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
-    if args.num_machines > 1:
-        current_env["MASTER_ADDR"] = args.main_process_ip
-        current_env["MASTER_PORT"] = str(args.main_process_port)
+    if num_machines > 1:
+        assert args.main_process_ip is not None, (
+            "When using multiple machines, you need to specify the main process IP."
+        )
+        assert args.main_process_port is not None, (
+            "When using multiple machines, you need to specify the main process port."
+        )
 
-        if args.mpirun_hostfile is not None:
-            current_env["CCL_WORKER_COUNT"] = str(mpirun_ccl)
-    elif args.num_processes > 1:
+    ccl_worker_count = getattr(args, "mpirun_ccl", 0) if is_ccl_available() else 0
+    if (num_processes is not None and num_processes > 1) or num_machines > 1:
         current_env["MASTER_ADDR"] = args.main_process_ip if args.main_process_ip is not None else "127.0.0.1"
         current_env["MASTER_PORT"] = str(args.main_process_port) if args.main_process_port is not None else "29500"
+        current_env["CCL_WORKER_COUNT"] = str(ccl_worker_count)
+    if current_env["ACCELERATE_USE_CPU"]:
+        current_env["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
+        current_env["KMP_BLOCKTIME"] = str(1)
 
     try:
         mixed_precision = PrecisionType(args.mixed_precision.lower())
@@ -182,6 +190,7 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
     current_env["ACCELERATE_DYNAMO_MODE"] = args.dynamo_mode
     current_env["ACCELERATE_DYNAMO_USE_FULLGRAPH"] = str(args.dynamo_use_fullgraph)
     current_env["ACCELERATE_DYNAMO_USE_DYNAMIC"] = str(args.dynamo_use_dynamic)
+    current_env["ACCELERATE_DYNAMO_USE_REGIONAL_COMPILATION"] = str(args.dynamo_use_regional_compilation)
 
     current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
     if is_ipex_available():
@@ -195,6 +204,13 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
     """
     Prepares and returns an environment with the correct multi-GPU environment variables.
     """
+    # get free port and update configurations
+    if args.main_process_port == 0:
+        args.main_process_port = get_free_port()
+
+    elif args.main_process_port is None:
+        args.main_process_port = 29500
+
     num_processes = args.num_processes
     num_machines = args.num_machines
     main_process_ip = args.main_process_ip
@@ -213,18 +229,25 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
         if main_process_port is not None:
             args.master_port = str(main_process_port)
 
-    if main_process_port is None:
-        main_process_port = 29500
-
     # only need to check port availability in main process, in case we have to start multiple launchers on the same machine
     # for some reasons like splitting log files.
     need_port_check = num_machines <= 1 or int(args.machine_rank) == 0
     if need_port_check and is_port_in_use(main_process_port):
-        raise ConnectionError(
-            f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
-            "Please specify a different port (such as using the `--main_process_port` flag or specifying a different `main_process_port` in your config file)"
-            " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
-        )
+        if num_machines <= 1:
+            args.standalone = True
+            warnings.warn(
+                f"Port `{main_process_port}` is already in use. "
+                "Accelerate will attempt to launch in a standalone-like mode by finding an open port automatically for this session. "
+                "If this current attempt fails, or for more control in future runs, please specify a different port "
+                "(e.g., `--main_process_port <your_chosen_port>`) or use `--main_process_port 0` for automatic selection "
+                "in your launch command or Accelerate config file."
+            )
+        else:
+            raise ConnectionError(
+                f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
+                "Please specify a different port (such as using the `--main_process_port` flag or specifying a different `main_process_port` in your config file)"
+                " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
+            )
 
     if args.module and args.no_python:
         raise ValueError("--module and --no_python cannot be used together")
@@ -276,6 +299,7 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
     current_env["ACCELERATE_DYNAMO_MODE"] = args.dynamo_mode
     current_env["ACCELERATE_DYNAMO_USE_FULLGRAPH"] = str(args.dynamo_use_fullgraph)
     current_env["ACCELERATE_DYNAMO_USE_DYNAMIC"] = str(args.dynamo_use_dynamic)
+    current_env["ACCELERATE_DYNAMO_USE_REGIONAL_COMPILATION"] = str(args.dynamo_use_regional_compilation)
 
     if args.use_fsdp:
         current_env["ACCELERATE_USE_FSDP"] = "true"
@@ -330,6 +354,13 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict
     """
     Prepares and returns the command list and an environment with the correct DeepSpeed environment variables.
     """
+    # get free port and update configurations
+    if args.main_process_port == 0:
+        args.main_process_port = get_free_port()
+
+    elif args.main_process_port is None:
+        args.main_process_port = 29500
+
     num_processes = args.num_processes
     num_machines = args.num_machines
     main_process_ip = args.main_process_ip
@@ -391,18 +422,25 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict
         if main_process_port is not None:
             args.master_port = str(main_process_port)
 
-    if main_process_port is None:
-        main_process_port = 29500
-
     # only need to check port availability in main process, in case we have to start multiple launchers on the same machine
     # for some reasons like splitting log files.
     need_port_check = num_machines <= 1 or int(args.machine_rank) == 0
     if need_port_check and is_port_in_use(main_process_port):
-        raise ConnectionError(
-            f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
-            "Please specify a different port (such as using the `--main_process_port` flag or specifying a different `main_process_port` in your config file)"
-            " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
-        )
+        if num_machines <= 1:
+            args.standalone = True
+            warnings.warn(
+                f"Port `{main_process_port}` is already in use. "
+                "Accelerate will attempt to launch in a standalone-like mode by finding an open port automatically for this session. "
+                "If this current attempt fails, or for more control in future runs, please specify a different port "
+                "(e.g., `--main_process_port <your_chosen_port>`) or use `--main_process_port 0` for automatic selection "
+                "in your launch command or Accelerate config file."
+            )
+        else:
+            raise ConnectionError(
+                f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
+                "Please specify a different port (such as using the `--main_process_port` flag or specifying a different `main_process_port` in your config file)"
+                " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
+            )
 
     if args.module and args.no_python:
         raise ValueError("--module and --no_python cannot be used together")
@@ -581,6 +619,7 @@ def prepare_sagemager_args_inputs(
         "ACCELERATE_DYNAMO_MODE": args.dynamo_mode,
         "ACCELERATE_DYNAMO_USE_FULLGRAPH": str(args.dynamo_use_fullgraph),
         "ACCELERATE_DYNAMO_USE_DYNAMIC": str(args.dynamo_use_dynamic),
+        "ACCELERATE_DYNAMO_USE_REGIONAL_COMPILATION": str(args.dynamo_use_regional_compilation),
         "ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE": sagemaker_config.distributed_type.value,
     }
     if args.mixed_precision.lower() == "fp8":

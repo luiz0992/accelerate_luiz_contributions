@@ -37,6 +37,7 @@ from ..utils import (
     check_cuda_fp8_capability,
     compare_versions,
     gather,
+    is_aim_available,
     is_bnb_available,
     is_clearml_available,
     is_comet_ml_available,
@@ -460,6 +461,13 @@ def require_comet_ml(test_case):
     return unittest.skipUnless(is_comet_ml_available(), "test requires comet_ml")(test_case)
 
 
+def require_aim(test_case):
+    """
+    Decorator marking a test that requires aim installed. These tests are skipped when aim isn't installed
+    """
+    return unittest.skipUnless(is_aim_available(), "test requires aim")(test_case)
+
+
 def require_clearml(test_case):
     """
     Decorator marking a test that requires clearml installed. These tests are skipped when clearml isn't installed
@@ -771,7 +779,7 @@ class SubprocessCallException(Exception):
 def run_command(command: list[str], return_stdout=False, env=None):
     """
     Runs `command` with `subprocess.check_output` and will potentially return the `stdout`. Will also properly capture
-    if an error occured while running `command`
+    if an error occurred while running `command`
     """
     # Cast every path in `command` to a string
     for i, c in enumerate(command):

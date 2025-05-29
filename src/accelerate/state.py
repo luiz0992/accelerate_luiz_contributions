@@ -32,7 +32,6 @@ from .utils import (
     check_cuda_fp8_capability,
     check_cuda_p2p_ib_support,
     deepspeed_required,
-    get_ccl_version,
     get_cpu_distributed_information,
     get_int_from_env,
     is_ccl_available,
@@ -214,6 +213,12 @@ class PartialState:
                             if self.backend == "tccl":
                                 local_rank = os.environ.get("LOCAL_RANK", -1)
                                 torch.sdaa.set_device(f"sdaa:{local_rank}")
+                            if (
+                                self.backend == "nccl"
+                                and os.environ.get("ACCELERATE_USE_FSDP", "false") == "true"
+                                and os.environ.get("FSDP_OFFLOAD_PARAMS", "false") == "true"
+                            ):
+                                self.backend = "cuda:nccl,cpu:gloo"
                             dist.init_distributed(dist_backend=self.backend, auto_mpi_discovery=False, **kwargs)
                         # We need to flag to `use_deepspeed` to be True to override `distributed_type` later
                         use_deepspeed = True
@@ -471,7 +476,7 @@ class PartialState:
                         tensorized_result = send_to_device(result, self.device)
                         result = pad_across_processes(tensorized_result, pad_index=inputs[-1])
                     else:
-                        result += [result[-1]] * (num_samples_per_process + 1 - len(result))
+                        result += [result[-1]] * (num_samples_per_process + (1 if num_extras > 0 else 0) - len(result))
                 return result
             elif isinstance(inputs, dict):
                 for key in inputs.keys():
@@ -488,7 +493,9 @@ class PartialState:
                             end_index = len(inputs)
                         result_idcs = list(range(start_index, end_index))
                         if apply_padding:
-                            result_idcs += [end_index - 1] * (num_samples_per_process + 1 - len(result_idcs))
+                            result_idcs += [end_index - 1] * (
+                                num_samples_per_process + (1 if num_extras > 0 else 0) - len(result_idcs)
+                            )
                         return inputs.select(result_idcs)
                 return inputs
 
@@ -789,10 +796,7 @@ class PartialState:
                 and is_ccl_available()
                 and (get_int_from_env(["CCL_WORKER_COUNT"], 0) > 0 or distributed_type == DistributedType.MULTI_XPU)
             ):
-                if get_ccl_version() >= "1.12":
-                    import oneccl_bindings_for_pytorch  # noqa: F401
-                else:
-                    import torch_ccl  # noqa: F401
+                import oneccl_bindings_for_pytorch  # noqa: F401
 
                 backend = "ccl"
             elif backend in (None, "mpi") and torch.distributed.is_mpi_available():
